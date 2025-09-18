@@ -1,0 +1,214 @@
+import network
+import urequests
+import time
+import json
+from machine import Pin, SPI, I2C
+from i2c_lcd import I2cLcd
+from mfrc522 import MFRC522 # Import library yang baru diupload
+import ntptime
+
+# ==========================================================
+# KONFIGURASI - SILAKAN UBAH BAGIAN INI
+# ==========================================================
+WIFI_SSID = "kvnd"
+WIFI_PASSWORD = "00000000"
+
+SUPABASE_URL = "https://oxkuxwkehinhyxfsauqe.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im94a3V4d2tlaGluaHl4ZnNhdXFlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc5NDYxOTMsImV4cCI6MjA3MzUyMjE5M30.g3BjGtZCSFxnBDwMWkaM2mEcnCkoDL92fvTP_gUgR20"
+
+# ID Perangkat (dari langkah sebelumnya)
+DEVICE_ID = 1
+
+# Pin untuk RFID Reader (SPI)
+PIN_RFID_CS = 5   # <-- Ganti nama (CS = Chip Select)
+PIN_RFID_SCK = 18
+PIN_RFID_MOSI = 23
+PIN_RFID_MISO = 19
+PIN_RFID_RST = 4
+
+# Pin untuk Buzzer
+PIN_BUZZER = 15
+
+# Konfigurasi I2C dan LCD
+PIN_I2C_SCL = 22  # <-- Ganti nama
+PIN_I2C_SDA = 21  # <-- Ganti nama
+# GANTI ALAMAT INI DENGAN HASIL SCANNER ANDA!
+LCD_I2C_ADDR = 0x27
+# ==========================================================
+
+def sync_time():
+    """Menyinkronkan waktu internal ESP32 dengan server NTP."""
+    print("Mencoba sinkronisasi waktu dengan server NTP...")
+    try:
+        # Perintah ini akan mengatur jam internal ESP32
+        ntptime.settime() 
+        print("Waktu berhasil disinkronkan.")
+    except Exception as e:
+        print(f"Gagal sinkronisasi waktu: {e}")
+        
+def beep(duration_ms=100):
+    """Nyalakan buzzer selama durasi tertentu."""
+    buzzer.value(1)  # Nyalakan buzzer
+    time.sleep_ms(duration_ms)
+    buzzer.value(0)  # Matikan buzzer
+
+def connect_wifi():
+    """Menghubungkan ESP32 ke WiFi."""
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print('Menghubungkan ke jaringan WiFi...')
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+        while not wlan.isconnected():
+            time.sleep(1)
+    print('Koneksi WiFi Berhasil!', wlan.ifconfig())
+    return True
+
+def log_attendance(member_id):
+    """Mengirim log kehadiran untuk member_id tertentu."""
+    print(f"Mencoba mengirim log untuk member ID: {member_id}...")
+
+    # --- BLOK PERUBAHAN DIMULAI DI SINI ---
+    try:
+        # Ambil waktu saat ini sebagai tuple (tahun, bulan, hari, jam, menit, detik, ...)
+        # Contoh: (2025, 9, 17, 10, 26, 55, 2, 260)
+        current_time = time.localtime()
+
+        # Format manual menjadi string 'YYYY-MM-DDTHH:MM:SS'
+        # Ini adalah pengganti time.strftime yang lebih andal
+        timestamp_str = "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}".format(
+            current_time[0], # Tahun, misal: 2025
+            current_time[1], # Bulan, misal: 9
+            current_time[2], # Hari, misal: 17
+            current_time[3], # Jam
+            current_time[4], # Menit
+            current_time[5]  # Detik
+        )
+    except Exception as e:
+        print(f"Gagal mendapatkan waktu lokal: {e}")
+        # Jika waktu tidak bisa didapat, kita hentikan fungsi agar tidak mengirim data salah
+        return
+
+    url = f"{SUPABASE_URL}/rest/v1/attendance_logs"
+    headers = {
+        'apikey': SUPABASE_KEY,
+        'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type': 'application/json'
+    }
+    payload = {
+        'organization_member_id': member_id,
+        'device_id': DEVICE_ID,
+        'event_type': 'check-in',
+        'method': 'rfid',
+        'event_time': timestamp_str # <-- Menggunakan timestamp yang sudah diformat manual
+    }
+    # --- BLOK PERUBAHAN SELESAI ---
+
+    try:
+        response = urequests.post(url, headers=headers, data=json.dumps(payload))
+        if response.status_code == 201:
+            print("Berhasil! Log absensi terkirim.")
+        else:
+            print(f"Gagal. Status: {response.status_code}, Pesan: {response.text}")
+        response.close()
+    except Exception as e:
+        print(f"Error saat request: {e}")
+
+def find_member_and_log(uid_str):
+    """Mencari member, menampilkan nama di LCD, dan mencatat kehadiran."""
+    print(f"Mencari member untuk UID: {uid_str}...")
+    
+    # Query ke Supabase untuk mengambil nama dari user_profiles yang terhubung
+    # Ini adalah query join: rfid_cards -> organization_members -> user_profiles
+    query = "organization_members(organization_member_id,user_profiles(first_name))"
+    url = f"{SUPABASE_URL}/rest/v1/rfid_cards?select={query}&card_number=ilike.{uid_str}"
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    
+    try:
+        response = urequests.get(url, headers=headers)
+        data = response.json()
+        
+        if response.status_code == 200 and data:
+            # Ambil data dari JSON yang nested/bersarang
+            member_data = data[0]['organization_members']
+            member_id = member_data['organization_member_id']
+            first_name = member_data['user_profiles']['first_name']
+            
+            print(f"Kartu terdaftar milik: {first_name} (ID: {member_id})")
+            
+            # Tampilkan nama di LCD
+            lcd.clear()
+            lcd.putstr("Selamat Datang")
+            lcd.move_to(0, 1) # Pindah ke baris kedua
+            lcd.putstr(first_name)
+            
+            # Kirim log kehadiran
+            log_attendance(member_id)
+        else:
+            print("--- KARTU TIDAK TERDAFTAR ---")
+            lcd.clear()
+            lcd.putstr("Kartu Anda")
+            lcd.move_to(0, 1)
+            lcd.putstr("Tidak Terdaftar")
+            
+        response.close()
+    except Exception as e:
+        print(f"Terjadi error: {e}")
+        lcd.clear()
+        lcd.putstr("Terjadi Error")
+
+# ==========================================================
+# PROGRAM UTAMA
+# ==========================================================
+# Inisialisasi WiFi
+if connect_wifi():
+    sync_time()
+
+# Inisialisasi RFID Reader
+spi = SPI(2, baudrate=2500000, polarity=0, phase=0)
+# Gunakan nama variabel baru di sini
+spi.init(sck=Pin(PIN_RFID_SCK), mosi=Pin(PIN_RFID_MOSI), miso=Pin(PIN_RFID_MISO))
+rdr = MFRC522(spi=spi, gpioRst=Pin(PIN_RFID_RST, Pin.OUT), gpioCs=Pin(PIN_RFID_CS, Pin.OUT))
+
+# Inisialisasi Buzzer
+buzzer = Pin(PIN_BUZZER, Pin.OUT)
+buzzer.value(0) # Pastikan buzzer mati di awal
+
+# Inisialisasi I2C dan LCD
+# Gunakan nama variabel baru di sini
+i2c = I2C(0, scl=Pin(PIN_I2C_SCL), sda=Pin(PIN_I2C_SDA))
+lcd = I2cLcd(i2c, LCD_I2C_ADDR, 2, 16) # 2 baris, 16 kolom
+
+# Tampilkan pesan selamat datang awal
+lcd.putstr("Sistem Absensi\nTempelkan Kartu")
+time.sleep(2)
+lcd.clear()
+lcd.putstr("Silakan Absen...")
+
+print("\nLetakkan kartu RFID Anda untuk absensi...")
+
+while True:
+    # Coba baca kartu
+    uid = rdr.read_uid()
+    
+    # Jika kartu terdeteksi (uid tidak None)
+    if uid:
+        beep() # <-- PANGGIL FUNGSI BEEP DI SINI
+
+        # Konversi 4 byte pertama UID menjadi string heksadesimal
+        uid_str = "".join(["{:02x}".format(x) for x in uid[0:4]])
+        print(f"Kartu terdeteksi! UID: {uid_str}")
+        
+        # Cari member dan catat kehadiran
+        find_member_and_log(uid_str)
+        
+        # Beri jeda agar tidak terjadi double-scan
+        print("\nSilakan letakkan kartu berikutnya...")
+        time.sleep(3)
+        
+        # Siapkan LCD untuk scan berikutnya
+        lcd.clear()
+        lcd.putstr("Silakan Absen...")
+    
+    # Jeda singkat agar loop tidak terlalu membebani CPU
+    time.sleep_ms(100)
